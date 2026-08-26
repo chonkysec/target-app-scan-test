@@ -18,7 +18,6 @@ on:
   # Schedule the CI job (this method uses cron syntax):
   schedule:
     - cron: '20 17 * * *' # Sets Semgrep to scan every day at 17:20 UTC.
-    # It is recommended to change the schedule to a random time.
 
 permissions:
   contents: read
@@ -30,6 +29,7 @@ jobs:
 
     # If you are self-hosting, change the following `runs-on` value:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     container:
       # A Docker image with Semgrep installed. Do not change this.
@@ -41,6 +41,18 @@ jobs:
     steps:
       # Fetch project source with GitHub Actions Checkout.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+
+      # A missing token is silent otherwise: the scan still runs, but the
+      # Critical + High blocking policy lives on the platform, so the gate
+      # quietly degrades to a linter.
+      - name: Require SEMGREP_APP_TOKEN
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+        run: |
+          if [ -z "$SEMGREP_APP_TOKEN" ]; then
+            echo "ERROR!!! SEMGREP_APP_TOKEN not found. Please set the token variable!"
+            exit 1
+          fi
 
       # Run Semgrep CI.
       #
@@ -57,3 +69,75 @@ jobs:
           # Generate a token from Semgrep AppSec Platform > Settings
           # and add it to your GitHub secrets.
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      # ------------------------------------------------------------------
+      # ALTERNATIVE: fail open on scanner failure, with an alert instead.
+      #
+      # Current behaviour (above) is fail CLOSED: any non-zero exit from
+      # semgrep ci fails the required check and blocks the merge — whether
+      # that was a real finding or the scanner not running at all.
+      #
+      # The version below separates those two cases:
+      #   exit 0      clean               -> pass
+      #   exit 1      blocking finding    -> FAIL (this is the gate)
+      #   otherwise   scanner error       -> pass, but alert the team
+      #
+      # Chosen against for now: a payments codebase would rather block a
+      # merge it cannot scan than ship one it did not. Kept here because
+      # the trade is worth revisiting once we know the real scan-failure
+      # rate across 120 repositories.
+      #
+      # To enable: replace the step above with the two below, and add the
+      # GCHAT_WEBHOOK_URL repository secret.
+      # ------------------------------------------------------------------
+      #
+      # - name: Run Semgrep
+      #   id: scan
+      #   continue-on-error: true
+      #   env:
+      #     SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      #   run: |
+      #     set +e
+      #     semgrep ci --no-suppress-errors --sarif --output semgrep.sarif
+      #     echo "code=$?" >> "$GITHUB_OUTPUT"
+      #
+      # - name: Gate — block on findings, fail open on scanner errors
+      #   env:
+      #     CHAT_WEBHOOK: ${{ secrets.GCHAT_WEBHOOK_URL }}
+      #     CODE: ${{ steps.scan.outputs.code }}
+      #     RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      #     PR: ${{ github.event.pull_request.html_url }}
+      #   run: |
+      #     case "$CODE" in
+      #       0) echo "Semgrep clean — no blocking findings."; exit 0 ;;
+      #       1) echo "::error::Blocking finding(s). Merge blocked."; exit 1 ;;
+      #     esac
+      #
+      #     # Anything else means the scanner itself did not complete.
+      #     # No webhook configured? Fail closed — an unscanned merge that
+      #     # nobody hears about is the one outcome with no recovery.
+      #     if [ -z "$CHAT_WEBHOOK" ]; then
+      #       echo "::error::Scanner failed (exit $CODE) and no webhook is set."
+      #       exit 1
+      #     fi
+      #
+      #     BODY=$(python3 -c '
+      #       import json, os
+      #       print(json.dumps({"text":
+      #         "*SAST gate failed open* - Semgrep did not complete.\n"
+      #         "*Repo:* {}\n*PR:* {}\n*Exit:* {}\n*Run:* {}\n"
+      #         "This pull request was NOT blocked.".format(
+      #           os.environ["GITHUB_REPOSITORY"], os.environ.get("PR","(push)"),
+      #           os.environ["CODE"], os.environ["RUN_URL"])}))')
+      #
+      #     # -f makes curl non-zero on 4xx/5xx, so a revoked webhook key
+      #     # cannot give us a silent pass that looks like it alerted someone.
+      #     if ! curl -sS -f -X POST \
+      #          -H "Content-Type: application/json; charset=UTF-8" \
+      #          -d "$BODY" "$CHAT_WEBHOOK" >/dev/null; then
+      #       echo "::error::Scanner failed AND the alert could not be delivered."
+      #       exit 1
+      #     fi
+      #
+      #     echo "::warning::Semgrep failed (exit $CODE). Failed open; alert sent."
+      #     exit 0
+        
